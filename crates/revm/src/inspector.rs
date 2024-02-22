@@ -1,3 +1,5 @@
+use core::ops::Range;
+
 use crate::{
     interpreter::{CallInputs, CreateInputs, Interpreter},
     primitives::{db::Database, Address, Log, U256},
@@ -16,7 +18,7 @@ mod noop;
 // Exports.
 
 pub use handler_register::{inspector_handle_register, inspector_instruction, GetInspector};
-use revm_interpreter::{CallOutcome, CreateOutcome, InterpreterResult};
+use revm_interpreter::{CallOutcome, CreateOutcome};
 
 /// [Inspector] implementations.
 pub mod inspectors {
@@ -80,29 +82,36 @@ pub trait Inspector<DB: Database> {
         &mut self,
         context: &mut EvmContext<DB>,
         inputs: &mut CallInputs,
+        return_memory_offset: Range<usize>,
     ) -> Option<CallOutcome> {
         let _ = context;
         let _ = inputs;
+        let _ = return_memory_offset;
         None
     }
 
     /// Called when a call to a contract has concluded.
     ///
-    /// InstructionResulting anything other than the values passed to this function (`(ret, remaining_gas,
-    /// out)`) will alter the result of the call.
+    /// The returned [CallOutcome] is used as the result of the call.
+    ///
+    /// This allows the inspector to modify the given `result` before returning it.
     #[inline]
     fn call_end(
         &mut self,
         context: &mut EvmContext<DB>,
-        result: InterpreterResult,
-    ) -> InterpreterResult {
+        inputs: &CallInputs,
+        outcome: CallOutcome,
+    ) -> CallOutcome {
         let _ = context;
-        result
+        let _ = inputs;
+        outcome
     }
 
     /// Called when a contract is about to be created.
     ///
-    /// InstructionResulting anything other than [crate::interpreter::InstructionResult::Continue] overrides the result of the creation.
+    /// If this returns `Some` then the [CreateOutcome] is used to override the result of the creation.
+    ///
+    /// If this returns `None` then the creation proceeds as normal.
     #[inline]
     fn create(
         &mut self,
@@ -122,11 +131,12 @@ pub trait Inspector<DB: Database> {
     fn create_end(
         &mut self,
         context: &mut EvmContext<DB>,
-        result: InterpreterResult,
-        address: Option<Address>,
+        inputs: &CreateInputs,
+        outcome: CreateOutcome,
     ) -> CreateOutcome {
         let _ = context;
-        CreateOutcome::new(result, address)
+        let _ = inputs;
+        outcome
     }
 
     /// Called when a contract has been self-destructed with funds transferred to target.

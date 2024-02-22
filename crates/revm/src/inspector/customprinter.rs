@@ -1,12 +1,14 @@
 //! Custom print inspector, it has step level information of execution.
 //! It is a great tool if some debugging is needed.
 
+use core::ops::Range;
+
 use revm_interpreter::CallOutcome;
 use revm_interpreter::CreateOutcome;
 
 use crate::{
     inspectors::GasInspector,
-    interpreter::{opcode, CallInputs, CreateInputs, Interpreter, InterpreterResult},
+    interpreter::{opcode, CallInputs, CreateInputs, Interpreter},
     primitives::{Address, U256},
     Database, EvmContext, GetInspector, Inspector,
 };
@@ -64,24 +66,26 @@ impl<DB: Database> Inspector<DB> for CustomPrintTracer {
     fn call_end(
         &mut self,
         context: &mut EvmContext<DB>,
-        result: InterpreterResult,
-    ) -> InterpreterResult {
-        self.gas_inspector.call_end(context, result)
+        inputs: &CallInputs,
+        outcome: CallOutcome,
+    ) -> CallOutcome {
+        self.gas_inspector.call_end(context, inputs, outcome)
     }
 
     fn create_end(
         &mut self,
         context: &mut EvmContext<DB>,
-        result: InterpreterResult,
-        address: Option<Address>,
+        inputs: &CreateInputs,
+        outcome: CreateOutcome,
     ) -> CreateOutcome {
-        self.gas_inspector.create_end(context, result, address)
+        self.gas_inspector.create_end(context, inputs, outcome)
     }
 
     fn call(
         &mut self,
         _context: &mut EvmContext<DB>,
         inputs: &mut CallInputs,
+        _return_memory_offset: Range<usize>,
     ) -> Option<CallOutcome> {
         println!(
             "SM CALL:   {:?}, context:{:?}, is_static:{:?}, transfer:{:?}, input_size:{:?}",

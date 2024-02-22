@@ -134,7 +134,8 @@ impl Precompiles {
 
     /// Returns precompiles for Cancun spec.
     ///
-    /// If `std` feature is not enabled KZG Point Evaluation precompile will not be included.
+    /// If the `c-kzg` feature is not enabled KZG Point Evaluation precompile will not be included,
+    /// effectively making this the same as Berlin.
     pub fn cancun() -> &'static Self {
         static INSTANCE: OnceBox<Precompiles> = OnceBox::new();
         INSTANCE.get_or_init(|| {
@@ -181,7 +182,6 @@ impl Precompiles {
     /// Returns the precompile for the given address.
     #[inline]
     pub fn get(&self, address: &Address) -> Option<Precompile> {
-        //return None;
         self.inner.get(address).cloned()
     }
 
@@ -258,6 +258,10 @@ impl PrecompileSpecId {
             LATEST => Self::LATEST,
             #[cfg(feature = "optimism")]
             BEDROCK | REGOLITH | CANYON => Self::BERLIN,
+            #[cfg(feature = "optimism")]
+            ECOTONE => Self::CANCUN,
+            #[cfg(feature = "taiko")]
+            KATLA => Self::BERLIN, // TODO(Cecilia): what is this?
         }
     }
 }

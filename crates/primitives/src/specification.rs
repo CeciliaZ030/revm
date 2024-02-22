@@ -1,11 +1,10 @@
 #![allow(non_camel_case_types)]
-
 pub use SpecId::*;
 
 /// Specification IDs and their activation block.
 ///
 /// Information was obtained from the [Ethereum Execution Specifications](https://github.com/ethereum/execution-specs)
-#[cfg(not(feature = "optimism"))]
+#[cfg(all(not(feature = "optimism"), not(feature = "taiko")))]
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, enumn::N)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -60,6 +59,37 @@ pub enum SpecId {
     SHANGHAI = 18,
     CANYON = 19,
     CANCUN = 20,
+    ECOTONE = 21,
+    LATEST = u8::MAX,
+}
+
+/// Specification IDs and their activation block.
+///
+/// Information was obtained from the [Ethereum Execution Specifications](https://github.com/ethereum/execution-specs)
+#[cfg(all(feature = "taiko", not(feature = "optimism")))]
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, enumn::N)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SpecId {
+    FRONTIER = 0,
+    FRONTIER_THAWING = 1,
+    HOMESTEAD = 2,
+    DAO_FORK = 3,
+    TANGERINE = 4,
+    SPURIOUS_DRAGON = 5,
+    BYZANTIUM = 6,
+    CONSTANTINOPLE = 7,
+    PETERSBURG = 8,
+    ISTANBUL = 9,
+    MUIR_GLACIER = 10,
+    BERLIN = 11,
+    LONDON = 12,
+    ARROW_GLACIER = 13,
+    GRAY_GLACIER = 14,
+    MERGE = 15,
+    SHANGHAI = 16,
+    KATLA = 17, // KATLA is before CANCUN, aka does not have 4844
+    CANCUN = 18,
     LATEST = u8::MAX,
 }
 
@@ -102,6 +132,10 @@ impl From<&str> for SpecId {
             "Regolith" => SpecId::REGOLITH,
             #[cfg(feature = "optimism")]
             "Canyon" => SpecId::CANYON,
+            #[cfg(feature = "optimism")]
+            "Ecotone" => SpecId::ECOTONE,
+            #[cfg(all(feature = "taiko", not(feature = "optimism")))]
+            "Katla" => SpecId::KATLA,
             _ => Self::LATEST,
         }
     }
@@ -157,6 +191,12 @@ spec!(BEDROCK, BedrockSpec);
 spec!(REGOLITH, RegolithSpec);
 #[cfg(feature = "optimism")]
 spec!(CANYON, CanyonSpec);
+#[cfg(feature = "optimism")]
+spec!(ECOTONE, EcotoneSpec);
+
+// Taiko Hardforks
+#[cfg(all(feature = "taiko", not(feature = "optimism")))]
+spec!(KATLA, KatlaSpec);
 
 #[macro_export]
 macro_rules! spec_to_generic {
@@ -230,6 +270,16 @@ macro_rules! spec_to_generic {
             #[cfg(feature = "optimism")]
             $crate::SpecId::CANYON => {
                 use $crate::CanyonSpec as SPEC;
+                $e
+            }
+            #[cfg(feature = "optimism")]
+            $crate::SpecId::ECOTONE => {
+                use $crate::EcotoneSpec as SPEC;
+                $e
+            }
+            #[cfg(all(feature = "taiko", not(feature = "optimism")))]
+            $crate::SpecId::KATLA => {
+                use $crate::KatlaSpec as SPEC;
                 $e
             }
         }
@@ -337,5 +387,45 @@ mod optimism_tests {
         assert!(SpecId::enabled(SpecId::CANYON, SpecId::BEDROCK));
         assert!(SpecId::enabled(SpecId::CANYON, SpecId::REGOLITH));
         assert!(SpecId::enabled(SpecId::CANYON, SpecId::CANYON));
+    }
+
+    #[test]
+    fn test_ecotone_post_merge_hardforks() {
+        assert!(EcotoneSpec::enabled(SpecId::MERGE));
+        assert!(EcotoneSpec::enabled(SpecId::SHANGHAI));
+        assert!(EcotoneSpec::enabled(SpecId::CANCUN));
+        assert!(!EcotoneSpec::enabled(SpecId::LATEST));
+        assert!(EcotoneSpec::enabled(SpecId::BEDROCK));
+        assert!(EcotoneSpec::enabled(SpecId::REGOLITH));
+        assert!(EcotoneSpec::enabled(SpecId::CANYON));
+        assert!(EcotoneSpec::enabled(SpecId::ECOTONE));
+    }
+
+    #[test]
+    fn test_ecotone_post_merge_hardforks_spec_id() {
+        assert!(SpecId::enabled(SpecId::ECOTONE, SpecId::MERGE));
+        assert!(SpecId::enabled(SpecId::ECOTONE, SpecId::SHANGHAI));
+        assert!(SpecId::enabled(SpecId::ECOTONE, SpecId::CANCUN));
+        assert!(!SpecId::enabled(SpecId::ECOTONE, SpecId::LATEST));
+        assert!(SpecId::enabled(SpecId::ECOTONE, SpecId::BEDROCK));
+        assert!(SpecId::enabled(SpecId::ECOTONE, SpecId::REGOLITH));
+        assert!(SpecId::enabled(SpecId::ECOTONE, SpecId::CANYON));
+        assert!(SpecId::enabled(SpecId::ECOTONE, SpecId::ECOTONE));
+    }
+}
+
+#[cfg(all(feature = "taiko", not(feature = "optimism")))]
+#[cfg(test)]
+mod taiko_tests {
+    use super::*;
+
+    // TODO(Cecilia):  update this range of bits
+    #[test]
+    fn test_katla_post_merge_hardforks() {
+        assert!(SpecId::enabled(SpecId::KATLA, SpecId::MERGE));
+        assert!(SpecId::enabled(SpecId::KATLA, SpecId::SHANGHAI));
+        assert!(!SpecId::enabled(SpecId::KATLA, SpecId::CANCUN));
+        assert!(!SpecId::enabled(SpecId::KATLA, SpecId::LATEST));
+        assert!(SpecId::enabled(SpecId::KATLA, SpecId::KATLA));
     }
 }

@@ -141,19 +141,19 @@ macro_rules! return_error {
 impl InstructionResult {
     /// Returns whether the result is a success.
     #[inline]
-    pub fn is_ok(self) -> bool {
+    pub const fn is_ok(self) -> bool {
         matches!(self, crate::return_ok!())
     }
 
     /// Returns whether the result is a revert.
     #[inline]
-    pub fn is_revert(self) -> bool {
+    pub const fn is_revert(self) -> bool {
         matches!(self, crate::return_revert!())
     }
 
     /// Returns whether the result is an error.
     #[inline]
-    pub fn is_error(self) -> bool {
+    pub const fn is_error(self) -> bool {
         matches!(self, return_error!())
     }
 }
@@ -166,7 +166,7 @@ pub enum SuccessOrHalt {
     FatalExternalError,
     /// Internal instruction that signals Interpreter should continue running.
     InternalContinue,
-    /// Internal instruction that signals subcall.
+    /// Internal instruction that signals call or create.
     InternalCallOrCreate,
 }
 

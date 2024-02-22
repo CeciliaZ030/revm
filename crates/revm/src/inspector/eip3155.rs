@@ -1,10 +1,11 @@
 use crate::{
     inspectors::GasInspector,
-    interpreter::{opcode, CallInputs, CreateInputs, Interpreter, InterpreterResult},
-    primitives::{db::Database, hex, Address, U256},
+    interpreter::{opcode, CallInputs, CreateInputs, Interpreter},
+    primitives::{db::Database, hex, U256},
     EvmContext, GetInspector, Inspector,
 };
 
+use core::ops::Range;
 use revm_interpreter::CallOutcome;
 use revm_interpreter::CreateOutcome;
 use serde_json::json;
@@ -91,6 +92,7 @@ impl<DB: Database> Inspector<DB> for TracerEip3155 {
         &mut self,
         _context: &mut EvmContext<DB>,
         _inputs: &mut CallInputs,
+        _return_memory_offset: Range<usize>,
     ) -> Option<CallOutcome> {
         None
     }
@@ -98,13 +100,14 @@ impl<DB: Database> Inspector<DB> for TracerEip3155 {
     fn call_end(
         &mut self,
         context: &mut EvmContext<DB>,
-        result: InterpreterResult,
-    ) -> InterpreterResult {
-        let result = self.gas_inspector.call_end(context, result);
+        inputs: &CallInputs,
+        outcome: CallOutcome,
+    ) -> CallOutcome {
+        let outcome = self.gas_inspector.call_end(context, inputs, outcome);
         if context.journaled_state.depth() == 0 {
             let log_line = json!({
                 //stateroot
-                "output": format!("0x{}", hex::encode(result.output.as_ref())),
+                "output": format!("0x{}", hex::encode(outcome.result.output.as_ref())),
                 "gasUsed": format!("0x{:x}", self.gas_inspector.gas_remaining()),
                 //time
                 //fork
@@ -113,7 +116,7 @@ impl<DB: Database> Inspector<DB> for TracerEip3155 {
             writeln!(self.output, "{}", serde_json::to_string(&log_line).unwrap())
                 .expect("If output fails we can ignore the logging");
         }
-        result
+        outcome
     }
 
     fn create(
@@ -127,10 +130,10 @@ impl<DB: Database> Inspector<DB> for TracerEip3155 {
     fn create_end(
         &mut self,
         context: &mut EvmContext<DB>,
-        result: InterpreterResult,
-        address: Option<Address>,
+        inputs: &CreateInputs,
+        outcome: CreateOutcome,
     ) -> CreateOutcome {
-        self.gas_inspector.create_end(context, result, address)
+        self.gas_inspector.create_end(context, inputs, outcome)
     }
 }
 

@@ -1,22 +1,24 @@
 use super::{
     merkle_trie::{log_rlp_hash, state_merkle_trie_root},
     models::{SpecName, Test, TestSuite},
+    utils::recover_address,
 };
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressDrawTarget};
 use revm::{
     db::EmptyDB,
     inspector_handle_register,
     inspectors::TracerEip3155,
     interpreter::CreateScheme,
     primitives::{
-        address, b256, calc_excess_blob_gas, keccak256, Bytecode, EVMResultGeneric, Env,
-        ExecutionResult, HashMap, SpecId, TransactTo, B256, U256,
+        calc_excess_blob_gas, keccak256, Bytecode, Bytes, EVMResultGeneric, Env, ExecutionResult,
+        SpecId, TransactTo, B256, U256,
     },
     Evm, State,
 };
+use serde_json::json;
 use std::{
     convert::Infallible,
-    io::stdout,
+    io::{stderr, stdout},
     path::{Path, PathBuf},
     sync::atomic::Ordering,
     sync::{atomic::AtomicBool, Arc, Mutex},
@@ -44,6 +46,11 @@ pub enum TestErrorKind {
     UnexpectedException {
         expected_exception: Option<String>,
         got_exception: Option<String>,
+    },
+    #[error("Unexpected output: {got_output:?} but test expects:{expected_output:?}")]
+    UnexpecteOutput {
+        expected_output: Option<Bytes>,
+        got_output: Option<Bytes>,
     },
     #[error(transparent)]
     SerdeDeserialize(#[from] serde_json::Error),
@@ -102,10 +109,36 @@ fn skip_test(path: &Path) -> bool {
 
 fn check_evm_execution<EXT>(
     test: &Test,
+    expected_output: Option<&Bytes>,
     test_name: &str,
     exec_result: &EVMResultGeneric<ExecutionResult, Infallible>,
     evm: &Evm<'_, EXT, &mut State<EmptyDB>>,
+    print_json_outcome: bool,
 ) -> Result<(), TestError> {
+    let logs_root = log_rlp_hash(&exec_result.as_ref().map(|r| r.logs()).unwrap_or_default());
+    let state_root = state_merkle_trie_root(evm.context.evm.db.cache.trie_account());
+
+    let print_json_output = |error: Option<String>| {
+        if print_json_outcome {
+            let json = json!({
+                    "stateRoot": state_root,
+                    "logsRoot": logs_root,
+                    "output": exec_result.as_ref().ok().and_then(|r| r.output().cloned()).unwrap_or_default(),
+                    "gasUsed": exec_result.as_ref().ok().map(|r| r.gas_used()).unwrap_or_default(),
+                    "pass": error.is_none(),
+                    "errorMsg": error.unwrap_or_default(),
+                    "evmResult": exec_result.as_ref().err().map(|e| e.to_string()).unwrap_or("Ok".to_string()),
+                    "postLogsHash": logs_root,
+                    "fork": evm.handler.spec_id(),
+                    "test": test_name,
+                    "d": test.indexes.data,
+                    "g": test.indexes.gas,
+                    "v": test.indexes.value,
+            });
+            eprintln!("{json}");
+        }
+    };
+
     // if we expect exception revm should return error from execution.
     // So we do not check logs and state root.
     //
@@ -118,43 +151,62 @@ fn check_evm_execution<EXT>(
     // and you can check that we have only two "hash" values for before and after state clear.
     match (&test.expect_exception, exec_result) {
         // do nothing
-        (None, Ok(_)) => (),
+        (None, Ok(result)) => {
+            // check output
+            if let Some((expected_output, output)) = expected_output.zip(result.output()) {
+                if expected_output != output {
+                    let kind = TestErrorKind::UnexpecteOutput {
+                        expected_output: Some(expected_output.clone()),
+                        got_output: result.output().cloned(),
+                    };
+                    print_json_output(Some(kind.to_string()));
+                    return Err(TestError {
+                        name: test_name.to_string(),
+                        kind,
+                    });
+                }
+            }
+        }
         // return okay, exception is expected.
         (Some(_), Err(_)) => return Ok(()),
         _ => {
+            let kind = TestErrorKind::UnexpectedException {
+                expected_exception: test.expect_exception.clone(),
+                got_exception: exec_result.clone().err().map(|e| e.to_string()),
+            };
+            print_json_output(Some(kind.to_string()));
             return Err(TestError {
                 name: test_name.to_string(),
-                kind: TestErrorKind::UnexpectedException {
-                    expected_exception: test.expect_exception.clone(),
-                    got_exception: exec_result.clone().err().map(|e| e.to_string()),
-                },
+                kind,
             });
         }
     }
 
-    let logs_root = log_rlp_hash(&exec_result.as_ref().map(|r| r.logs()).unwrap_or_default());
-
     if logs_root != test.logs {
+        let kind = TestErrorKind::LogsRootMismatch {
+            got: logs_root,
+            expected: test.logs,
+        };
+        print_json_output(Some(kind.to_string()));
         return Err(TestError {
             name: test_name.to_string(),
-            kind: TestErrorKind::LogsRootMismatch {
-                got: logs_root,
-                expected: test.logs,
-            },
+            kind,
         });
     }
-
-    let state_root = state_merkle_trie_root(evm.context.evm.db.cache.trie_account());
 
     if state_root != test.hash {
+        let kind = TestErrorKind::StateRootMismatch {
+            got: state_root,
+            expected: test.hash,
+        };
+        print_json_output(Some(kind.to_string()));
         return Err(TestError {
             name: test_name.to_string(),
-            kind: TestErrorKind::StateRootMismatch {
-                got: state_root,
-                expected: test.hash,
-            },
+            kind,
         });
     }
+
+    print_json_output(None);
 
     Ok(())
 }
@@ -163,6 +215,7 @@ pub fn execute_test_suite(
     path: &Path,
     elapsed: &Arc<Mutex<Duration>>,
     trace: bool,
+    print_json_outcome: bool,
 ) -> Result<(), TestError> {
     if skip_test(path) {
         return Ok(());
@@ -173,34 +226,6 @@ pub fn execute_test_suite(
         name: path.to_string_lossy().into_owned(),
         kind: e.into(),
     })?;
-
-    let map_caller_keys: HashMap<_, _> = [
-        (
-            b256!("45a915e4d060149eb4365960e6a7a45f334393093061116b197e3240065ff2d8"),
-            address!("a94f5374fce5edbc8e2a8697c15331677e6ebf0b"),
-        ),
-        (
-            b256!("c85ef7d79691fe79573b1a7064c19c1a9819ebdbd1faaab1a8ec92344438aaf4"),
-            address!("cd2a3d9f938e13cd947ec05abc7fe734df8dd826"),
-        ),
-        (
-            b256!("044852b2a670ade5407e78fb2863c51de9fcb96542a07186fe3aeda6bb8a116d"),
-            address!("82a978b3f5962a5b0957d9ee9eef472ee55b42f1"),
-        ),
-        (
-            b256!("6a7eeac5f12b409d42028f66b0b2132535ee158cfda439e3bfdd4558e8f4bf6c"),
-            address!("c9c5a15a403e41498b6f69f6f89dd9f5892d21f7"),
-        ),
-        (
-            b256!("a95defe70ebea7804f9c3be42d20d24375e2a92b9d9666b832069c5f3cd423dd"),
-            address!("3fb1cd2cd96c6d5c0b5eb3322d807b34482481d4"),
-        ),
-        (
-            b256!("fe13266ff57000135fb9aa854bbfe455d8da85b21f626307bf3263a0c2a8e7fe"),
-            address!("dcc5ba93a1ed7e045690d722f2bf460a51c61415"),
-        ),
-    ]
-    .into();
 
     for (name, unit) in suite.0 {
         // Create database and insert cache
@@ -228,7 +253,7 @@ pub fn execute_test_suite(
         env.block.basefee = unit.env.current_base_fee.unwrap_or_default();
         env.block.difficulty = unit.env.current_difficulty;
         // after the Merge prevrandao replaces mix_hash field in block and replaced difficulty opcode in EVM.
-        env.block.prevrandao = Some(unit.env.current_difficulty.to_be_bytes().into());
+        env.block.prevrandao = unit.env.current_random;
         // EIP-4844
         if let (Some(parent_blob_gas_used), Some(parent_excess_blob_gas)) = (
             unit.env.parent_blob_gas_used,
@@ -242,11 +267,14 @@ pub fn execute_test_suite(
         }
 
         // tx env
-        let pk = unit.transaction.secret_key;
-        env.tx.caller = map_caller_keys.get(&pk).copied().ok_or_else(|| TestError {
-            name: name.clone(),
-            kind: TestErrorKind::UnknownPrivateKey(pk),
-        })?;
+        env.tx.caller = if let Some(address) = unit.transaction.sender {
+            address
+        } else {
+            recover_address(unit.transaction.secret_key.as_slice()).ok_or_else(|| TestError {
+                name: name.clone(),
+                kind: TestErrorKind::UnknownPrivateKey(unit.transaction.secret_key),
+            })?
+        };
         env.tx.gas_price = unit
             .transaction
             .gas_price
@@ -321,36 +349,55 @@ pub fn execute_test_suite(
                     .build();
 
                 // do the deed
-                let timer = Instant::now();
                 let (e, exec_result) = if trace {
                     let mut evm = evm
                         .modify()
                         .reset_handler_with_external_context(TracerEip3155::new(
-                            Box::new(stdout()),
+                            Box::new(stderr()),
                             false,
                             true,
                         ))
                         .append_handler_register(inspector_handle_register)
                         .build();
-                    let res = evm.transact_commit();
 
-                    let Err(e) = check_evm_execution(&test, &name, &res, &evm) else {
+                    let timer = Instant::now();
+                    let res = evm.transact_commit();
+                    *elapsed.lock().unwrap() += timer.elapsed();
+
+                    let Err(e) = check_evm_execution(
+                        &test,
+                        unit.out.as_ref(),
+                        &name,
+                        &res,
+                        &evm,
+                        print_json_outcome,
+                    ) else {
                         continue;
                     };
                     // reset external context
                     (e, res)
                 } else {
+                    let timer = Instant::now();
                     let res = evm.transact_commit();
+                    *elapsed.lock().unwrap() += timer.elapsed();
 
                     // dump state and traces if test failed
-                    let Err(e) = check_evm_execution(&test, &name, &res, &evm) else {
+                    let output = check_evm_execution(
+                        &test,
+                        unit.out.as_ref(),
+                        &name,
+                        &res,
+                        &evm,
+                        print_json_outcome,
+                    );
+                    let Err(e) = output else {
                         continue;
                     };
                     (e, res)
                 };
-                *elapsed.lock().unwrap() += timer.elapsed();
 
-                // print only once
+                // print only once or
+                // if we are already in trace mode, just return error
                 static FAILED: AtomicBool = AtomicBool::new(false);
                 if FAILED.swap(true, Ordering::SeqCst) {
                     return Err(e);
@@ -396,14 +443,23 @@ pub fn run(
     test_files: Vec<PathBuf>,
     mut single_thread: bool,
     trace: bool,
+    mut print_outcome: bool,
 ) -> Result<(), TestError> {
+    // trace implies print_outcome
     if trace {
+        print_outcome = true;
+    }
+    // print_outcome or trace implies single_thread
+    if print_outcome {
         single_thread = true;
     }
     let n_files = test_files.len();
 
     let endjob = Arc::new(AtomicBool::new(false));
-    let console_bar = Arc::new(ProgressBar::new(n_files as u64));
+    let console_bar = Arc::new(ProgressBar::with_draw_target(
+        Some(n_files as u64),
+        ProgressDrawTarget::stdout(),
+    ));
     let queue = Arc::new(Mutex::new((0usize, test_files)));
     let elapsed = Arc::new(Mutex::new(std::time::Duration::ZERO));
 
@@ -436,11 +492,10 @@ pub fn run(
                 (prev_idx, test_path)
             };
 
-            if let Err(err) = execute_test_suite(&test_path, &elapsed, trace) {
+            if let Err(err) = execute_test_suite(&test_path, &elapsed, trace, print_outcome) {
                 endjob.store(true, Ordering::SeqCst);
                 return Err(err);
             }
-
             console_bar.inc(1);
         };
         handles.push(thread.spawn(f).unwrap());
@@ -453,7 +508,6 @@ pub fn run(
             errors.push(e);
         }
     }
-
     console_bar.finish();
 
     println!(

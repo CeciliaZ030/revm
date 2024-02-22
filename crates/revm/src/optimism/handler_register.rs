@@ -8,20 +8,22 @@ use crate::{
     interpreter::{return_ok, return_revert, Gas, InstructionResult},
     optimism,
     primitives::{
-        db::Database, spec_to_generic, Account, EVMError, Env, ExecutionResult, HaltReason,
-        HashMap, InvalidTransaction, Output, ResultAndState, Spec, SpecId, SpecId::REGOLITH, U256,
+        db::Database, spec_to_generic, Account, EVMError, ExecutionResult, HaltReason, HashMap,
+        InvalidTransaction, ResultAndState, Spec, SpecId, SpecId::REGOLITH, U256,
     },
-    Context,
+    Context, FrameResult,
 };
 use alloc::sync::Arc;
 use core::ops::Mul;
 
 pub fn optimism_handle_register<DB: Database, EXT>(handler: &mut EvmHandler<'_, EXT, DB>) {
     spec_to_generic!(handler.spec_id, {
-        // Refund is calculated differently then mainnet.
-        handler.execution_loop.first_frame_return = Arc::new(handle_call_return::<SPEC>);
+        // load l1 data
+        handler.pre_execution.load_accounts = Arc::new(load_accounts::<SPEC, EXT, DB>);
         // An estimated batch cost is charged from the caller and added to L1 Fee Vault.
         handler.pre_execution.deduct_caller = Arc::new(deduct_caller::<SPEC, EXT, DB>);
+        // Refund is calculated differently then mainnet.
+        handler.execution.last_frame_return = Arc::new(last_frame_return::<SPEC, EXT, DB>);
         handler.post_execution.reward_beneficiary = Arc::new(reward_beneficiary::<SPEC, EXT, DB>);
         // In case of halt of deposit transaction return Error.
         handler.post_execution.output = Arc::new(output::<SPEC, EXT, DB>);
@@ -31,21 +33,26 @@ pub fn optimism_handle_register<DB: Database, EXT>(handler: &mut EvmHandler<'_, 
 
 /// Handle output of the transaction
 #[inline]
-pub fn handle_call_return<SPEC: Spec>(
-    env: &Env,
-    call_result: InstructionResult,
-    returned_gas: Gas,
-) -> Gas {
+pub fn last_frame_return<SPEC: Spec, EXT, DB: Database>(
+    context: &mut Context<EXT, DB>,
+    frame_result: &mut FrameResult,
+) {
+    let env = context.evm.env();
     let is_deposit = env.tx.optimism.source_hash.is_some();
     let is_optimism = env.cfg.optimism;
     let tx_system = env.tx.optimism.is_system_transaction;
     let tx_gas_limit = env.tx.gas_limit;
     let is_regolith = SPEC::enabled(REGOLITH);
+
+    let instruction_result = frame_result.interpreter_result().result;
+    let gas = frame_result.gas_mut();
+    let remaining = gas.remaining();
+    let refunded = gas.refunded();
     // Spend the gas limit. Gas is reimbursed when the tx returns successfully.
-    let mut gas = Gas::new(tx_gas_limit);
+    *gas = Gas::new(tx_gas_limit);
     gas.record_cost(tx_gas_limit);
 
-    match call_result {
+    match instruction_result {
         return_ok!() => {
             // On Optimism, deposit transactions report gas usage uniquely to other
             // transactions due to them being pre-paid on L1.
@@ -63,8 +70,8 @@ pub fn handle_call_return<SPEC: Spec>(
             if is_optimism && (!is_deposit || is_regolith) {
                 // For regular transactions prior to Regolith and all transactions after
                 // Regolith, gas is reported as normal.
-                gas.erase_cost(returned_gas.remaining());
-                gas.record_refund(returned_gas.refunded());
+                gas.erase_cost(remaining);
+                gas.record_refund(refunded);
             } else if is_deposit && tx_system.unwrap_or(false) {
                 // System transactions were a special type of deposit transaction in
                 // the Bedrock hardfork that did not incur any gas costs.
@@ -85,17 +92,35 @@ pub fn handle_call_return<SPEC: Spec>(
             //     gas used on failure. Refunds on remaining gas enabled.
             //   - Regular transactions receive a refund on remaining gas as normal.
             if is_optimism && (!is_deposit || is_regolith) {
-                gas.erase_cost(returned_gas.remaining());
+                gas.erase_cost(remaining);
             }
         }
         _ => {}
     }
     // Prior to Regolith, deposit transactions did not receive gas refunds.
-    if !is_deposit && SPEC::enabled(REGOLITH) {
-        gas.set_final_refund::<SPEC>()
+    let is_gas_refund_disabled = is_optimism && is_deposit && !is_regolith;
+    if !is_gas_refund_disabled {
+        gas.set_final_refund::<SPEC>();
+    }
+}
+
+/// Load account (make them warm) and l1 data from database.
+#[inline]
+pub fn load_accounts<SPEC: Spec, EXT, DB: Database>(
+    context: &mut Context<EXT, DB>,
+) -> Result<(), EVMError<DB::Error>> {
+    // the L1-cost fee is only computed for Optimism non-deposit transactions.
+
+    if context.evm.env.cfg.optimism && context.evm.env.tx.optimism.source_hash.is_none() {
+        let l1_block_info =
+            crate::optimism::L1BlockInfo::try_fetch(&mut context.evm.db, SPEC::SPEC_ID)
+                .map_err(EVMError::Database)?;
+
+        // storage l1 block info for later use.
+        context.evm.l1_block_info = Some(l1_block_info);
     }
 
-    gas
+    mainnet::load_accounts::<SPEC, EXT, DB>(context)
 }
 
 /// Deduct max balance from caller
@@ -220,11 +245,9 @@ pub fn reward_beneficiary<SPEC: Spec, EXT, DB: Database>(
 #[inline]
 pub fn output<SPEC: Spec, EXT, DB: Database>(
     context: &mut Context<EXT, DB>,
-    call_result: InstructionResult,
-    output: Output,
-    gas: &Gas,
+    frame_result: FrameResult,
 ) -> Result<ResultAndState, EVMError<DB::Error>> {
-    let result = mainnet::output::<EXT, DB>(context, call_result, output, gas)?;
+    let result = mainnet::output::<EXT, DB>(context, frame_result)?;
 
     if result.result.is_halt() {
         // Post-regolith, if the transaction is a deposit transaction and it halts,
@@ -313,12 +336,36 @@ pub fn end<SPEC: Spec, EXT, DB: Database>(
 
 #[cfg(test)]
 mod tests {
+    use revm_interpreter::{CallOutcome, InterpreterResult};
+
     use super::*;
     use crate::{
         db::InMemoryDB,
-        primitives::{bytes, state::AccountInfo, Address, BedrockSpec, Env, RegolithSpec, B256},
+        primitives::{
+            bytes, state::AccountInfo, Address, BedrockSpec, Bytes, Env, RegolithSpec, B256,
+        },
         L1BlockInfo,
     };
+
+    /// Creates frame result.
+    fn call_last_frame_return<SPEC: Spec>(
+        env: Env,
+        instruction_result: InstructionResult,
+        gas: Gas,
+    ) -> Gas {
+        let mut ctx = Context::new_empty();
+        ctx.evm.env = Box::new(env);
+        let mut first_frame = FrameResult::Call(CallOutcome::new(
+            InterpreterResult {
+                result: instruction_result,
+                output: Bytes::new(),
+                gas,
+            },
+            0..0,
+        ));
+        last_frame_return::<SPEC, _, _>(&mut ctx, &mut first_frame);
+        *first_frame.gas()
+    }
 
     #[test]
     fn test_revert_gas() {
@@ -327,7 +374,8 @@ mod tests {
         env.cfg.optimism = true;
         env.tx.optimism.source_hash = None;
 
-        let gas = handle_call_return::<BedrockSpec>(&env, InstructionResult::Revert, Gas::new(90));
+        let gas =
+            call_last_frame_return::<BedrockSpec>(env, InstructionResult::Revert, Gas::new(90));
         assert_eq!(gas.remaining(), 90);
         assert_eq!(gas.spend(), 10);
         assert_eq!(gas.refunded(), 0);
@@ -340,7 +388,8 @@ mod tests {
         env.cfg.optimism = false;
         env.tx.optimism.source_hash = None;
 
-        let gas = handle_call_return::<BedrockSpec>(&env, InstructionResult::Revert, Gas::new(90));
+        let gas =
+            call_last_frame_return::<BedrockSpec>(env, InstructionResult::Revert, Gas::new(90));
         // else branch takes all gas.
         assert_eq!(gas.remaining(), 0);
         assert_eq!(gas.spend(), 100);
@@ -354,7 +403,8 @@ mod tests {
         env.cfg.optimism = true;
         env.tx.optimism.source_hash = Some(B256::ZERO);
 
-        let gas = handle_call_return::<RegolithSpec>(&env, InstructionResult::Stop, Gas::new(90));
+        let gas =
+            call_last_frame_return::<RegolithSpec>(env, InstructionResult::Stop, Gas::new(90));
         assert_eq!(gas.remaining(), 90);
         assert_eq!(gas.spend(), 10);
         assert_eq!(gas.refunded(), 0);
@@ -370,12 +420,13 @@ mod tests {
         let mut ret_gas = Gas::new(90);
         ret_gas.record_refund(20);
 
-        let gas = handle_call_return::<RegolithSpec>(&env, InstructionResult::Stop, ret_gas);
+        let gas =
+            call_last_frame_return::<RegolithSpec>(env.clone(), InstructionResult::Stop, ret_gas);
         assert_eq!(gas.remaining(), 90);
         assert_eq!(gas.spend(), 10);
-        assert_eq!(gas.refunded(), 20);
+        assert_eq!(gas.refunded(), 2); // min(20, 10/5)
 
-        let gas = handle_call_return::<RegolithSpec>(&env, InstructionResult::Revert, ret_gas);
+        let gas = call_last_frame_return::<RegolithSpec>(env, InstructionResult::Revert, ret_gas);
         assert_eq!(gas.remaining(), 90);
         assert_eq!(gas.spend(), 10);
         assert_eq!(gas.refunded(), 0);
@@ -388,7 +439,7 @@ mod tests {
         env.cfg.optimism = true;
         env.tx.optimism.source_hash = Some(B256::ZERO);
 
-        let gas = handle_call_return::<BedrockSpec>(&env, InstructionResult::Stop, Gas::new(90));
+        let gas = call_last_frame_return::<BedrockSpec>(env, InstructionResult::Stop, Gas::new(90));
         assert_eq!(gas.remaining(), 0);
         assert_eq!(gas.spend(), 100);
         assert_eq!(gas.refunded(), 0);
@@ -408,8 +459,9 @@ mod tests {
         let mut context: Context<(), InMemoryDB> = Context::new_with_db(db);
         context.evm.l1_block_info = Some(L1BlockInfo {
             l1_base_fee: U256::from(1_000),
-            l1_fee_overhead: U256::from(1_000),
-            l1_fee_scalar: U256::from(1_000),
+            l1_fee_overhead: Some(U256::from(1_000)),
+            l1_base_fee_scalar: U256::from(1_000),
+            ..Default::default()
         });
         // Enveloped needs to be some but it will deduce zero fee.
         context.evm.env.tx.optimism.enveloped_tx = Some(bytes!(""));
@@ -441,8 +493,9 @@ mod tests {
         let mut context: Context<(), InMemoryDB> = Context::new_with_db(db);
         context.evm.l1_block_info = Some(L1BlockInfo {
             l1_base_fee: U256::from(1_000),
-            l1_fee_overhead: U256::from(1_000),
-            l1_fee_scalar: U256::from(1_000),
+            l1_fee_overhead: Some(U256::from(1_000)),
+            l1_base_fee_scalar: U256::from(1_000),
+            ..Default::default()
         });
         // l1block cost is 1048 fee.
         context.evm.env.tx.optimism.enveloped_tx = Some(bytes!("FACADE"));
@@ -477,8 +530,9 @@ mod tests {
         let mut context: Context<(), InMemoryDB> = Context::new_with_db(db);
         context.evm.l1_block_info = Some(L1BlockInfo {
             l1_base_fee: U256::from(1_000),
-            l1_fee_overhead: U256::from(1_000),
-            l1_fee_scalar: U256::from(1_000),
+            l1_fee_overhead: Some(U256::from(1_000)),
+            l1_base_fee_scalar: U256::from(1_000),
+            ..Default::default()
         });
         // l1block cost is 1048 fee.
         context.evm.env.tx.optimism.enveloped_tx = Some(bytes!("FACADE"));
@@ -507,8 +561,9 @@ mod tests {
         let mut context: Context<(), InMemoryDB> = Context::new_with_db(db);
         context.evm.l1_block_info = Some(L1BlockInfo {
             l1_base_fee: U256::from(1_000),
-            l1_fee_overhead: U256::from(1_000),
-            l1_fee_scalar: U256::from(1_000),
+            l1_fee_overhead: Some(U256::from(1_000)),
+            l1_base_fee_scalar: U256::from(1_000),
+            ..Default::default()
         });
         // l1block cost is 1048 fee.
         context.evm.env.tx.optimism.enveloped_tx = Some(bytes!("FACADE"));
