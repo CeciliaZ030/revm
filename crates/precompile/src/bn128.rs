@@ -3,6 +3,8 @@ use crate::{
 };
 use alloc::vec::Vec;
 use bn::{AffineG1, AffineG2, Fq, Fq2, Group, Gt, G1, G2};
+use revm_primitives::Bytes;
+use sp1_precompiles::{bn254::Bn254, utils::AffinePoint};
 
 pub mod add {
     use super::*;
@@ -132,7 +134,37 @@ fn new_g1_point(px: Fq, py: Fq) -> Result<G1, Error> {
     }
 }
 
-fn run_add(input: &[u8]) -> Result<Vec<u8>, Error> {
+#[cfg(all(
+    not(all(target_os = "zkvm", target_vendor = "succinct"))
+))]
+pub fn run_add(input: &[u8]) -> Result<Vec<u8>, Error> {
+    use sp1_precompiles::bn254::Bn254;
+
+    let mut points = [[0u8; 32]; 4];
+    for i in 0..4 {
+        points[i] = *right_pad::<32>(&input[i * 32..(i + 1) * 32]);
+        points[i].reverse();
+    }
+    let mut a = sp1_precompiles::utils::AffinePoint::<Bn254>::from(points[0], points[1]);
+    let b = sp1_precompiles::utils::AffinePoint::<Bn254>::from(points[2], points[3]);
+    a.add_assign(&b);
+
+    Ok(le_point_to_be_bytes(&a.to_le_bytes()))
+}
+
+fn le_point_to_be_bytes(point: &[u8]) -> Vec<u8> {
+    let mut x = [0u8; 32];
+    x.copy_from_slice(&point[..32]);
+    x.reverse();
+    let mut y = [0u8; 32];
+    y.copy_from_slice(&point[32..]);
+    y.reverse();
+    [x, y].concat().to_vec()
+}
+
+
+#[cfg(all(target_os = "zkvm", target_vendor = "succinct"))]
+pub fn run_add(input: &[u8]) -> Result<Vec<u8>, Error> {
     let input = right_pad::<ADD_INPUT_LEN>(input);
 
     let p1 = read_point(&input[..64])?;
@@ -153,7 +185,29 @@ fn run_add(input: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(output.into())
 }
 
-fn run_mul(input: &[u8]) -> Result<Vec<u8>, Error> {
+// #[cfg(all(target_os = "zkvm", target_vendor = "succinct"))]
+pub fn run_mul_(input: &[u8]) -> Result<Vec<u8>, Error> {
+    use sp1_precompiles::bn254::Bn254;
+
+    let x = *right_pad::<32>(&input[..32]);
+    let y = *right_pad::<32>(&input[32..64]);
+    let mut s = *right_pad::<32>(&input[64..96]);
+    let scalar: [u32; 8] = s
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect::<Vec<u32>>()
+        .try_into()
+        .unwrap();
+
+    let mut point = sp1_precompiles::utils::AffinePoint::<Bn254>::from(x, y);
+    point.mul_assign(&scalar);
+    Ok(le_point_to_be_bytes(&point.to_le_bytes()))
+}
+
+#[cfg(all(
+    not(all(target_os = "zkvm", target_vendor = "succinct"))
+))]
+pub fn run_mul(input: &[u8]) -> Result<Vec<u8>, Error> {
     let input = right_pad::<MUL_INPUT_LEN>(input);
 
     let p = read_point(&input[..64])?;
@@ -166,7 +220,7 @@ fn run_mul(input: &[u8]) -> Result<Vec<u8>, Error> {
         mul.x().to_big_endian(&mut out[..32]).unwrap();
         mul.y().to_big_endian(&mut out[32..]).unwrap();
     }
-    Ok(out.to_vec())
+    Ok(out.into())
 }
 
 fn run_pair(
@@ -227,6 +281,66 @@ fn run_pair(
     out[31] = success as u8;
     Ok((gas_used, out.to_vec()))
 }
+
+#[test]
+fn test_bn(){
+    use crate::primitives::hex;
+    let input = hex::decode(
+        "\
+         18b18acfb4c2c30276db5411368e7185b311dd124691610c5d3b74034e093dc9\
+         063c909c4720840cb5134cb9f59fa749755796819658d32efc0d288198f37266\
+         07c2b7f58a84bd6145f00c9c2bc0bb1a187f20ff2c92963a88019e7c6a014eed\
+         06614e20c147e940f2d70da3f74c9a17df361706a4485c742bd6788478fa17d7",
+    )
+    .unwrap();
+    let expected = hex::decode(
+        "\
+        2243525c5efd4b9c3d3c45ac0ca3fe4dd85e830a4ce6b65fa1eeaee202839703\
+        301d1d33be6da8e509df21cc35964723180eed7532537db9ae5e7d48f195c915",
+    )
+    .unwrap();
+
+    println!("{:?}", input);
+
+    run_add(&input).unwrap();
+
+    let p1 = read_point(&input[..64]).unwrap();
+    let p2 = read_point(&input[64..]).unwrap();
+
+    let mut p1x =  [0u8; 32];
+    p1.x().to_big_endian(&mut p1x).unwrap();
+    println!("p1 {:?}\np1.x() {:?}", p1x, p1.x());
+
+    let mut genb =  [0u8; 64];
+    let gen = G1::one();
+    gen.x().to_big_endian(&mut genb[32..]).unwrap();
+    gen.y().to_big_endian(&mut genb[..32]).unwrap();
+    genb.reverse();
+    println!("gen {:?}", genb);
+
+
+    let mut a: [u8; 64] = [
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0,
+    ];
+
+    assert!(a == genb);
+
+    println!("{:?}", hex::encode(a));
+
+    // 2 * generator.
+    // 1368015179489954701390400359078579693043519447331113978918064868415326638035
+    // 9918110051302171585080402603319702774565515993150576347155970296011118125764
+    let b: [u8; 64] = [
+        211, 207, 135, 109, 193, 8, 194, 211, 168, 28, 135, 22, 169, 22, 120, 217, 133, 21, 24,
+        104, 91, 4, 133, 155, 2, 26, 19, 46, 231, 68, 6, 3, 196, 162, 24, 90, 122, 191, 62, 255,
+        199, 143, 83, 227, 73, 164, 166, 104, 10, 156, 174, 178, 150, 95, 132, 231, 146, 124, 10,
+        14, 140, 115, 237, 21,
+    ];
+
+}
+
 
 /*
 #[cfg(test)]
