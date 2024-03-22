@@ -4,7 +4,14 @@ use crate::{
 use alloc::vec::Vec;
 use bn::{AffineG1, AffineG2, Fq, Fq2, Group, Gt, G1, G2};
 use revm_primitives::Bytes;
-use sp1_precompiles::{bn254::Bn254, utils::AffinePoint};
+
+cfg_if::cfg_if! {
+    if #[cfg(all(target_os = "zkvm", target_vendor = "succinct"))] {
+        use sp1_precompiles::{bn254::Bn254, utils::AffinePoint};
+        use succinct::{run_add, run_mul};
+    } else {}
+}
+
 
 pub mod add {
     use super::*;
@@ -134,36 +141,58 @@ fn new_g1_point(px: Fq, py: Fq) -> Result<G1, Error> {
     }
 }
 
+
+#[cfg(all(target_os = "zkvm", target_vendor = "succinct"))]
+mod succinct {
+    pub fn run_add(input: &[u8]) -> Result<Vec<u8>, Error> {
+        use sp1_precompiles::bn254::Bn254;
+    
+        let mut points = [[0u8; 32]; 4];
+        for i in 0..4 {
+            points[i] = *right_pad::<32>(&input[i * 32..(i + 1) * 32]);
+            points[i].reverse();
+        }
+        let mut a = sp1_precompiles::utils::AffinePoint::<Bn254>::from(points[0], points[1]);
+        let b = sp1_precompiles::utils::AffinePoint::<Bn254>::from(points[2], points[3]);
+        a.add_assign(&b);
+    
+        Ok(le_to_be_point(&a.to_le_bytes()))
+    }
+
+    pub fn run_mul(input: &[u8]) -> Result<Vec<u8>, Error> {
+        use sp1_precompiles::bn254::Bn254;
+    
+        let x = *right_pad::<32>(&input[..32]);
+        let y = *right_pad::<32>(&input[32..64]);
+        let mut s = *right_pad::<32>(&input[64..96]);
+
+        let scalar: [u32; 8] = s
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<u32>>()
+            .try_into()
+            .unwrap();
+    
+        let mut point = sp1_precompiles::utils::AffinePoint::<Bn254>::from(x, y);
+        point.mul_assign(&scalar);
+
+        Ok(le_to_be_point(&point.to_le_bytes()))
+    }
+
+    fn le_to_be_point(point: &[u8]) -> Vec<u8> {
+        let mut x = [0u8; 32];
+        x.copy_from_slice(&point[..32]);
+        x.reverse();
+        let mut y = [0u8; 32];
+        y.copy_from_slice(&point[32..]);
+        y.reverse();
+        [x, y].concat().to_vec()
+    }
+}
+
 #[cfg(all(
     not(all(target_os = "zkvm", target_vendor = "succinct"))
 ))]
-pub fn run_add(input: &[u8]) -> Result<Vec<u8>, Error> {
-    use sp1_precompiles::bn254::Bn254;
-
-    let mut points = [[0u8; 32]; 4];
-    for i in 0..4 {
-        points[i] = *right_pad::<32>(&input[i * 32..(i + 1) * 32]);
-        points[i].reverse();
-    }
-    let mut a = sp1_precompiles::utils::AffinePoint::<Bn254>::from(points[0], points[1]);
-    let b = sp1_precompiles::utils::AffinePoint::<Bn254>::from(points[2], points[3]);
-    a.add_assign(&b);
-
-    Ok(le_point_to_be_bytes(&a.to_le_bytes()))
-}
-
-fn le_point_to_be_bytes(point: &[u8]) -> Vec<u8> {
-    let mut x = [0u8; 32];
-    x.copy_from_slice(&point[..32]);
-    x.reverse();
-    let mut y = [0u8; 32];
-    y.copy_from_slice(&point[32..]);
-    y.reverse();
-    [x, y].concat().to_vec()
-}
-
-
-#[cfg(all(target_os = "zkvm", target_vendor = "succinct"))]
 pub fn run_add(input: &[u8]) -> Result<Vec<u8>, Error> {
     let input = right_pad::<ADD_INPUT_LEN>(input);
 
@@ -185,24 +214,6 @@ pub fn run_add(input: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(output.into())
 }
 
-// #[cfg(all(target_os = "zkvm", target_vendor = "succinct"))]
-pub fn run_mul_(input: &[u8]) -> Result<Vec<u8>, Error> {
-    use sp1_precompiles::bn254::Bn254;
-
-    let x = *right_pad::<32>(&input[..32]);
-    let y = *right_pad::<32>(&input[32..64]);
-    let mut s = *right_pad::<32>(&input[64..96]);
-    let scalar: [u32; 8] = s
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-        .collect::<Vec<u32>>()
-        .try_into()
-        .unwrap();
-
-    let mut point = sp1_precompiles::utils::AffinePoint::<Bn254>::from(x, y);
-    point.mul_assign(&scalar);
-    Ok(le_point_to_be_bytes(&point.to_le_bytes()))
-}
 
 #[cfg(all(
     not(all(target_os = "zkvm", target_vendor = "succinct"))
