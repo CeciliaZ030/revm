@@ -144,6 +144,9 @@ fn new_g1_point(px: Fq, py: Fq) -> Result<G1, Error> {
 
 #[cfg(all(target_os = "zkvm", target_vendor = "succinct"))]
 mod succinct {
+    
+    use super::*;
+
     pub fn run_add(input: &[u8]) -> Result<Vec<u8>, Error> {
         use sp1_precompiles::bn254::Bn254;
     

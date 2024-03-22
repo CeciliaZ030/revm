@@ -38,13 +38,6 @@ cfg_if::cfg_if! {
     }
 }
 
-cfg_if::cfg_if! {
-    if #[cfg(all(target_os = "zkvm", target_vendor = "succinct"))] {
-        use sp1_precompiles::{bn254::Bn254, utils::AffinePoint};
-        use succinct::{run_add, run_mul};
-    } else {}
-}
-
 #[cfg(feature = "c-kzg")]
 pub use kzg::{EnvKzgSettings, KzgSettings};
 pub use precompile::*;
