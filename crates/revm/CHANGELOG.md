@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.2.1](https://github.com/CeciliaZ030/revm/compare/revm-v7.2.0...revm-v7.2.1) - 2024-03-26
+
+### Fixed
+- fix eip3155 summary gas_used bug and add fork name ([#1216](https://github.com/CeciliaZ030/revm/pull/1216))
+
+### Other
+- *(interpreter)* unbox contract field ([#1228](https://github.com/CeciliaZ030/revm/pull/1228))
+- *(primitives)* kzg intro ([#1209](https://github.com/CeciliaZ030/revm/pull/1209))
+- *(interpreter)* keep track of remaining gas rather than spent ([#1221](https://github.com/CeciliaZ030/revm/pull/1221))
+- Improve `EthersDB` ([#1208](https://github.com/CeciliaZ030/revm/pull/1208))
+
 ## [7.2.0](https://github.com/bluealloy/revm/compare/revm-v7.1.0...revm-v7.2.0) - 2024-03-19
 
 ### Added
