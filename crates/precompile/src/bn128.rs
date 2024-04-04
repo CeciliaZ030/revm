@@ -4,6 +4,7 @@ use crate::{
 use alloc::vec::Vec;
 use bn::{AffineG1, AffineG2, Fq, Fq2, Group, Gt, G1, G2};
 use revm_primitives::Bytes;
+use sp1_precompiles::utils::AffinePoint;
 
 cfg_if::cfg_if! {
     if #[cfg(all(target_os = "zkvm", target_vendor = "succinct"))] {
@@ -140,9 +141,8 @@ fn new_g1_point(px: Fq, py: Fq) -> Result<G1, Error> {
             .map_err(|_| Error::Bn128AffineGFailedToCreate)
     }
 }
+use sp1_precompiles::bn254::Bn254;
 
-
-#[cfg(all(target_os = "zkvm", target_vendor = "succinct"))]
 mod succinct {
     
     use super::*;
@@ -182,7 +182,7 @@ mod succinct {
         Ok(le_to_be_point(&point.to_le_bytes()))
     }
 
-    fn le_to_be_point(point: &[u8]) -> Vec<u8> {
+    pub fn le_to_be_point(point: &[u8]) -> Vec<u8> {
         let mut x = [0u8; 32];
         x.copy_from_slice(&point[..32]);
         x.reverse();
@@ -321,6 +321,7 @@ fn test_bn(){
     let p1 = read_point(&input[..64]).unwrap();
     let p2 = read_point(&input[64..]).unwrap();
 
+
     let mut p1x =  [0u8; 32];
     p1.x().to_big_endian(&mut p1x).unwrap();
     println!("p1 {:?}\np1.x() {:?}", p1x, p1.x());
@@ -338,7 +339,9 @@ fn test_bn(){
         0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0,
     ];
-
+    let a_point = AffinePoint::<Bn254>::from(a[0..32].try_into().unwrap(), a[32..64].try_into().unwrap());
+    a = a_point.to_le_bytes();
+    
     assert!(a == genb);
 
     println!("{:?}", hex::encode(a));
@@ -352,6 +355,16 @@ fn test_bn(){
         199, 143, 83, 227, 73, 164, 166, 104, 10, 156, 174, 178, 150, 95, 132, 231, 146, 124, 10,
         14, 140, 115, 237, 21,
     ];
+
+    let be_a = succinct::le_to_be_point(&a);
+    println!("{:?}", be_a);
+    let p1 = read_point(&be_a).unwrap();
+    assert!(p1 == gen);
+
+    let p3 = p1 + p1;
+    let mut p3x =  [0u8; 32];
+    p3.x().to_big_endian(&mut p3x).unwrap();
+    println!("p1 {:?}\np1.x() {:?}", p3x, p3.x());
 
 }
 
