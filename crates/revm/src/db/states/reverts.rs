@@ -3,9 +3,9 @@ use super::{
     StorageWithOriginalValues,
 };
 use core::ops::{Deref, DerefMut};
-use revm_interpreter::primitives::{AccountInfo, Address, HashMap, U256};
+use revm_interpreter::primitives::{AccountInfo, HashMap, U256};
 use crate::primitives::ChainAddress;
-use std::vec::Vec;
+use std::{collections::HashSet, vec::Vec};
 
 /// Contains reverts of multiple account in multiple transitions (Transitions as a block).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -44,33 +44,60 @@ impl Reverts {
         self.0.extend(other.0);
     }
 
-    /// Consume reverts and create plain state reverts.
+    /// Generate a [`PlainStateReverts`].
     ///
     /// Note that account are sorted by address.
-    pub fn into_plain_state_reverts(mut self) -> PlainStateReverts {
+    pub fn to_plain_state_reverts(&self) -> PlainStateReverts {
+        // To keep track of all chains in the changeset
+        let mut chain_ids = HashSet::new();
+
         let mut state_reverts = PlainStateReverts::with_capacity(self.0.len());
-        for reverts in self.0.drain(..) {
+        for reverts in &self.0 {
             // pessimistically pre-allocate assuming _all_ accounts changed.
             let mut accounts = Vec::with_capacity(reverts.len());
             let mut storage = Vec::with_capacity(reverts.len());
             for (address, revert_account) in reverts.into_iter() {
-                match revert_account.account {
-                    AccountInfoRevert::RevertTo(acc) => accounts.push((address, Some(acc))),
-                    AccountInfoRevert::DeleteIt => accounts.push((address, None)),
+                // Keep track of each chain used
+                chain_ids.insert(address.0);
+
+                let address = &address.1;
+                match &revert_account.account {
+                    AccountInfoRevert::RevertTo(acc) => {
+                        // cloning is cheap, because account info has 3 small
+                        // fields and a Bytes
+                        accounts.push((*address, Some(acc.clone())))
+                    }
+                    AccountInfoRevert::DeleteIt => accounts.push((*address, None)),
                     AccountInfoRevert::DoNothing => (),
                 }
                 if revert_account.wipe_storage || !revert_account.storage.is_empty() {
                     storage.push(PlainStorageRevert {
-                        address,
+                        address: *address,
                         wiped: revert_account.wipe_storage,
-                        storage_revert: revert_account.storage.into_iter().collect::<Vec<_>>(),
+                        storage_revert: revert_account
+                            .storage
+                            .iter()
+                            .map(|(k, v)| (*k, *v))
+                            .collect::<Vec<_>>(),
                     });
                 }
             }
             state_reverts.accounts.push(accounts);
             state_reverts.storage.push(storage);
         }
+
+        // Check if we created a valid state chain set for a single chain
+        assert_eq!(chain_ids.len(), 1, "state changeset contains state of multiple chains: {:?}", chain_ids);
+
         state_reverts
+    }
+
+    /// Consume reverts and create [`PlainStateReverts`].
+    ///
+    /// Note that account are sorted by address.
+    #[deprecated = "Use `to_plain_state_reverts` instead"]
+    pub fn into_plain_state_reverts(self) -> PlainStateReverts {
+        self.to_plain_state_reverts()
     }
 }
 

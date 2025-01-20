@@ -1,7 +1,7 @@
 mod call_helpers;
 
 pub use call_helpers::{calc_call_gas, get_memory_input_and_out_ranges, resize_memory};
-use revm_primitives::{CallOptions, ChainAddress};
+use revm_primitives::{CallOptions, ChainAddress, OnChain};
 
 use crate::{
     gas::{self, cost_per_word, EOF_CREATE_GAS, KECCAK256WORD, MIN_CALLEE_GAS},
@@ -15,6 +15,7 @@ use crate::{
 use core::cmp::max;
 use std::boxed::Box;
 
+#[derive(Debug, Clone)]
 pub struct CallTargets {
     /// The account address of bytecode that is going to be executed.
     ///
@@ -156,6 +157,7 @@ pub fn return_contract<H: Host + ?Sized>(interpreter: &mut Interpreter, _host: &
             output,
             gas: interpreter.gas,
             result,
+            call_options: None
         },
     };
 }
@@ -412,6 +414,7 @@ pub fn create<const IS_CREATE2: bool, H: Host + ?Sized, SPEC: Spec>(
 }
 
 pub fn call<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
+    //println!("contract::call");
     pop!(interpreter, local_gas_limit);
     pop_address!(interpreter, to);
 
@@ -468,6 +471,7 @@ pub fn call<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &
 }
 
 pub fn call_code<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
+    //println!("contract::call_code");
     pop!(interpreter, local_gas_limit);
     pop_address!(interpreter, to);
 
@@ -520,6 +524,7 @@ pub fn call_code<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, ho
 }
 
 pub fn delegate_call<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
+    //println!("contract::delegate_call");
     check!(interpreter, HOMESTEAD);
     pop!(interpreter, local_gas_limit);
     pop_address!(interpreter, to);
@@ -565,6 +570,7 @@ pub fn delegate_call<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter
 }
 
 pub fn static_call<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
+    //println!("contract::static_call");
     check!(interpreter, BYZANTIUM);
     pop!(interpreter, local_gas_limit);
     pop_address!(interpreter, to);
@@ -608,26 +614,55 @@ pub fn static_call<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, 
     interpreter.instruction_result = InstructionResult::CallOrCreate;
 }
 
+/// Collects call options for this CAL
+/// This consumes the data from the PREVIOUS call into the XCALLOPTIONS precompile.
 pub fn apply_call_options<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H, to: Address, delegate: bool, code: bool) -> CallTargets {
-    let call_options = interpreter.call_options.clone().unwrap_or_else(||
-        CallOptions{
-            chain_id: interpreter.chain_id,
-            sandbox: false,
-            tx_origin: host.env().tx.caller,
-            msg_sender: interpreter.contract.target_address,
-            block_hash: None,
-            proof: Vec::new(),
+    //println!("apply_call_options {:?}", interpreter.call_options);
+    let (call_options, to) = match interpreter.call_options.clone() {
+        Some(mut call_options) => {
+            if !call_options.sandbox {
+                // Already checked in precompiles but let's do it again
+                if call_options.msg_sender.1 != interpreter.contract.target_address.1
+                    || call_options.tx_origin.1 != host.env().tx.caller.1
+                {
+                    interpreter.instruction_result = InstructionResult::Stop;
+                }
+            }
+            // In delegate call, the caller & target address remains on the same chain
+            // Otherwise set to the other chain.
+            let to = if delegate {
+                call_options.msg_sender.0 = interpreter.chain_id;
+                ChainAddress(interpreter.chain_id, to)
+            } else {
+                ChainAddress(call_options.chain_id, to)
+            };
+            (call_options, to)
+        },
+        None => {
+            (
+                CallOptions {
+                    chain_id: interpreter.chain_id,
+                    sandbox: false,
+                    tx_origin: host.env().tx.caller,
+                    msg_sender: interpreter.contract.target_address,
+                    block_hash: None,
+                    proof: Vec::new(),
+                },
+                ChainAddress(interpreter.chain_id, to)
+            )
         }
-    );
+    };
+
+    let call_targets = CallTargets {
+        target_address: if delegate || code { call_options.msg_sender } else { to },
+        caller: if delegate { interpreter.contract.caller } else { call_options.msg_sender },
+        bytecode_address: if delegate { to.1.on_chain(call_options.chain_id) } else { to },
+    };
+
+    //println!("call targets {:?}", call_targets);
+
     // Consume the values
     interpreter.call_options = None;
 
-    // Set the specified chain id on the to address
-    let to = ChainAddress(call_options.chain_id, to);
-
-    CallTargets {
-        target_address: if delegate || code { interpreter.contract.target_address } else { to },
-        caller: if delegate { interpreter.contract.caller } else { interpreter.contract.target_address },
-        bytecode_address: to,
-    }
+    call_targets
 }
